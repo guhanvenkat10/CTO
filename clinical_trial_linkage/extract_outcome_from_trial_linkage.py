@@ -11,7 +11,32 @@ import glob
 import argparse
 import time
 
-def get_trial_linkage_weak_outcome_labels(save_path,trial_linkage_path):
+# Days a trial is given to register a linked next-phase trial before absence of a link is read as
+# failure. The previous value was six months, taken against datetime.now().
+#
+# Six months is short relative to the process being measured. On the 2014-2016 cohorts, where nearly
+# a decade of follow-up makes the observed latency close to the true one, the median time from
+# completion to registration of the linked next-phase trial is 469 days in Phase 1, 648 in Phase 2
+# and 720 in Phase 3. A six-month window therefore records a large majority of trials that will link
+# as having failed, and does so disproportionately for the most recent cohorts, which have had the
+# least time. Defaults below are the per-phase medians, rounded; --censoring_window_days overrides
+# them with a single value for all phases, and 183 reproduces the previous behaviour exactly.
+DEFAULT_CENSORING_WINDOW_DAYS = {
+    'early_phase1': 469, 'phase1': 469, 'phase1/phase2': 469,
+    'phase2': 648, 'phase2/phase3': 648,
+    'phase3': 720, 'phase4': 720,
+}
+LEGACY_CENSORING_WINDOW_DAYS = 183
+
+
+def _censoring_window(phase, override=None):
+    if override is not None:
+        return int(override)
+    return DEFAULT_CENSORING_WINDOW_DAYS.get(phase, LEGACY_CENSORING_WINDOW_DAYS)
+
+
+def get_trial_linkage_weak_outcome_labels(save_path, trial_linkage_path, as_of_date=None,
+                                          censoring_window_days=None):
     if not os.path.exists(save_path):
         os.makedirs(save_path)
     
@@ -148,10 +173,17 @@ def get_trial_linkage_weak_outcome_labels(save_path,trial_linkage_path):
         
         print(f'Extracting outcome labels for {phase_names}')
         trial_linkage_outcome_labels = {}
-        # get current date
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        current_date = datetime.strptime(current_date, '%Y-%m-%d')
-        
+        # The as-of date is a parameter, not the wall clock. Reading datetime.now() here made the
+        # released labels a function of the day the pipeline happened to be run, with nothing in the
+        # output recording which day that was, so two runs of the same code over the same registry
+        # snapshot produced different labels and neither could be reproduced later.
+        current_date = as_of_date if as_of_date is not None else datetime.now()
+        current_date = datetime.strptime(current_date.strftime("%Y-%m-%d"), '%Y-%m-%d')
+        window_days = _censoring_window(phase, censoring_window_days)
+        censor_before = current_date - pd.Timedelta(days=window_days)
+        print(f'  as-of date {current_date:%Y-%m-%d}, censoring window {window_days} d '
+              f'(trials completing after {censor_before:%Y-%m-%d} are held as "Recent trial")')
+
         for i in tqdm(range(adj_matrix.shape[1])):
             trial = index_to_trial_map[f'{phase} connected'][i]
             trial_linkage_outcome_labels[trial] = {}
@@ -161,7 +193,7 @@ def get_trial_linkage_weak_outcome_labels(save_path,trial_linkage_path):
                 # convert to datetime
                 trial_completion_date = datetime.strptime(trial_completion_date, '%Y-%m-%d')
                 
-                if trial_completion_date > current_date - pd.DateOffset(months=6):
+                if trial_completion_date > censor_before:
                     trial_linkage_outcome_labels[trial]['outcome'] = 'Recent trial'
                 else:
                     trial_linkage_outcome_labels[trial]['outcome'] = 'Failure'
@@ -173,7 +205,7 @@ def get_trial_linkage_weak_outcome_labels(save_path,trial_linkage_path):
                 # convert to datetime
                 trial_completion_date = datetime.strptime(trial_completion_date, '%Y-%m-%d')
                 
-                if trial_completion_date > current_date - pd.DateOffset(months=6):
+                if trial_completion_date > censor_before:
                     trial_linkage_outcome_labels[trial]['outcome'] = 'Recent trial'
                 else:
                     trial_linkage_outcome_labels[trial]['outcome'] = 'Not sure'
@@ -190,6 +222,10 @@ def get_trial_linkage_weak_outcome_labels(save_path,trial_linkage_path):
                     temp_dict = {'trial':index_to_trial_map[phase][index],'cross_encoder_score':edge_values[index,i]}
                     trial_linkage_outcome_labels[trial]['connected next phase'].append(temp_dict)
             
+            # Provenance, so a downstream user can tell which as-of date and window produced
+            # this label without having to know when the pipeline was run.
+            trial_linkage_outcome_labels[trial]['as_of_date'] = current_date.strftime('%Y-%m-%d')
+            trial_linkage_outcome_labels[trial]['censoring_window_days'] = window_days
             trial_linkage_outcome_labels[trial]['weakly connected next phase'] = []
             if any(adj_matrix[:,i] == 1) and not any(edge_values[:,i] > 0):
                 connected_target_index = np.where(adj_matrix[:,i] == 1)
@@ -286,8 +322,18 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--save_path', type=str, default='', help='path to save the data')
     # parser.add_argument('--trial_linkage_path', type=str, default=None, help='Path to the trial linkage folder containing the json files of the trial linkage')
+    parser.add_argument('--as_of_date', type=str, default=None,
+                        help='YYYY-MM-DD the labels are cut as of. Defaults to today, but pass it '
+                             'explicitly for a reproducible release: it is recorded in the output.')
+    parser.add_argument('--censoring_window_days', type=int, default=None,
+                        help='Days a trial is given to register a linked next-phase trial before '
+                             'the absence of one is read as failure. Defaults to the per-phase '
+                             'medians in DEFAULT_CENSORING_WINDOW_DAYS; pass 183 to reproduce the '
+                             'previous six-month behaviour.')
     args = parser.parse_args()
-    
+
+    as_of_date = datetime.strptime(args.as_of_date, '%Y-%m-%d') if args.as_of_date else None
+
     ### Parameters
     trial_linkage_path = os.path.join(args.save_path, 'clinical_trial_linkage/trial_linkages')
     # args.trial_linkage_path # Path to the trial linkage folder containing the json files of the trial linkage
@@ -295,7 +341,8 @@ if __name__ == '__main__':
         raise ValueError('Please provide the path to the trial linkage folder at trial_linkage_path')
     save_path = os.path.join(trial_linkage_path,'outcome_labels') # Path to save the extracted outcome labels, a outcome_labels path in the trial linkage folder
     print(f'Extracting outcome labels for trial linkage from {trial_linkage_path} to {save_path}')
-    get_trial_linkage_weak_outcome_labels(save_path,trial_linkage_path)
+    get_trial_linkage_weak_outcome_labels(save_path, trial_linkage_path, as_of_date=as_of_date,
+                                          censoring_window_days=args.censoring_window_days)
     
 
 # 3

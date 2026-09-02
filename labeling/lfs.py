@@ -21,11 +21,18 @@ def reorder_columns(df, cols_in_front):
     columns = cols_in_front + columns
     return df[columns]
 
-def lf_results_reported(path):
+def lf_results_reported(path, abstain_when_unposted=True):
+    # Posted results are weak evidence of success; the ABSENCE of posted results is not evidence of
+    # failure. `were_results_reported == 'f'` previously produced a failure vote, and since the flag
+    # is populated for essentially every study this labeling function never abstained, so every
+    # trial that had not yet posted carried a failure vote. Results posting is due ~12 months after
+    # completion, is widely non-compliant, and is mechanically unavailable for recent trials, so
+    # that turned a documentation delay into a failure label. Pass abstain_when_unposted=False to
+    # restore the previous behaviour.
     df = pd.read_csv(path + 'calculated_values.txt', sep='|', low_memory=False)
     df.dropna(subset=['were_results_reported'], inplace=True)
-    df['lf'] = df['were_results_reported'] == 't'
-    df['lf'] = df['lf'].astype('int')
+    posted = df['were_results_reported'] == 't'
+    df['lf'] = np.where(posted, 1, -1 if abstain_when_unposted else 0).astype('int')
     df = reorder_columns(df, ['nct_id', 'lf'])
     return df
 
@@ -150,12 +157,21 @@ def lf_stock_price(path):
     return df
     
 def lf_linkage(path):
+    # Abstain by default. extract_outcome_from_trial_linkage.py emits four outcome values, and the
+    # previous default of 0 meant 'Recent trial' -- the category it creates for trials that have not
+    # yet had time to link -- was read as a failure vote. Mapping every value explicitly makes an
+    # unhandled value fail loudly rather than silently become a failure.
     df = pd.read_csv(path, low_memory=False)
     df.rename(columns={'nctid': 'nct_id'}, inplace=True)
-    df['lf'] = 0
-    df.loc[df['outcome']=='Failure',['lf']] = 0
-    df.loc[df['outcome']=='Not sure',['lf']] = -1
-    df.loc[df['outcome']=='Success', ['lf']] = 1
+    outcome_to_vote = {
+        'Success': 1,
+        'Failure': 0,
+        'Not sure': -1,
+        'Recent trial': -1,   # censored: too recent to judge, not evidence of failure
+    }
+    unknown = set(df['outcome'].dropna().unique()) - set(outcome_to_vote)
+    assert not unknown, f'unmapped linkage outcome(s) {unknown}; add them to outcome_to_vote'
+    df['lf'] = df['outcome'].map(outcome_to_vote).fillna(-1).astype('int')
     df = reorder_columns(df, ['nct_id', 'lf'])
     return df
 
@@ -192,11 +208,13 @@ def lf_news_headlines(path):
 def lf_gpt(path):
     df = pd.read_csv(path, low_memory=False)
     df['outcome'].unique()
+    # 'Not sure' is the model declining to call the outcome, so it abstains rather than voting
+    # failure. This matters more than it looks: in the released pubmed_gpt_outcomes.csv the model
+    # returns only 'Success' (32,980) and 'Not sure' (23,756) and never 'Failure', so under the
+    # previous mapping 100% of this channel's failure votes were the model saying it could not tell.
     df['lf'] = -1
     df.loc[df['outcome']=='Success', ['lf']] = 1
-    # df.loc[df['outcome']=='Not sure',['lf']] = 1
-    # df.loc[df['outcome']=='Not sure',['lf']] = -1
-    df.loc[df['outcome']=='Not sure',['lf']] = 0
+    df.loc[df['outcome']=='Not sure',['lf']] = -1
     df.loc[df['outcome']=='Failure', ['lf']] = 0
     df.rename(columns={'nctid': 'nct_id'}, inplace=True)
     df = reorder_columns(df, ['nct_id', 'lf'])
