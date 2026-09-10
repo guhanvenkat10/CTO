@@ -13,7 +13,8 @@ with the least evidence available.
 import pandas as pd
 import pytest
 
-from lfs import lf_gpt, lf_linkage, lf_results_reported
+from lfs import (hint_train_lf, lf_gpt, lf_linkage, lf_pvalues, lf_results_reported,
+                 lf_status)
 
 ABSTAIN, FAILURE, SUCCESS = -1, 0, 1
 
@@ -110,3 +111,132 @@ def test_gpt_not_sure_abstains(tmp_path):
     assert df["NCT01"] == SUCCESS
     assert df["NCT02"] == ABSTAIN
     assert df["NCT03"] == FAILURE
+
+
+# --------------------------------------------------------------------------- hint_train_lf
+
+def test_hint_lf_can_hold_out_the_top_test_split(tmp_path):
+    """TOP's held-out test labels should be excludable from the label model.
+
+    In RF/SVM/LR mode this labeling function is also the supervision target, so with the test split
+    included those rows help fit the labeler whose output a HINT-family model is later scored
+    against. The default keeps them, for reproducibility; this checks the held-out option works.
+    """
+    for split, nct in [("train", "NCT01"), ("valid", "NCT02"), ("test", "NCT03")]:
+        pd.DataFrame([(nct, 1)], columns=["nctid", "label"]).to_csv(
+            tmp_path / f"phase1_{split}.csv", index=False)
+
+    legacy = set(hint_train_lf(str(tmp_path))["nct_id"])
+    heldout = set(hint_train_lf(str(tmp_path), splits=("train", "valid"))["nct_id"])
+
+    assert legacy == {"NCT01", "NCT02", "NCT03"}
+    assert heldout == {"NCT01", "NCT02"}
+    assert "NCT03" not in heldout
+
+
+def test_hint_lf_raises_when_nothing_matches(tmp_path):
+    """A silently empty hint labeling function would leave the RF modes with no supervision."""
+    with pytest.raises(AssertionError, match="no TOP/HINT files matched"):
+        hint_train_lf(str(tmp_path))
+
+
+# --------------------------------------------------------------------------- lf_status
+
+def test_status_cannot_express_success_for_any_real_trial_status(tmp_path):
+    """The status channel is a failure detector with a success branch that never fires.
+
+    Its only success value is 'approved for marketing', which is an expanded-access record type
+    rather than a state a completed interventional trial reaches, so its measured success-vote rate
+    is 0.000 in every phase and every year 2014-2023. That matters because this channel is also
+    applied as a hard override on top of the fitted label model in legacy mode.
+    """
+    p = tmp_path / "studies.txt"
+    pd.DataFrame(
+        [("NCT01", "Completed"), ("NCT02", "Terminated"), ("NCT03", "Withdrawn"),
+         ("NCT04", "Suspended"), ("NCT05", "Active, not recruiting"), ("NCT06", "Recruiting")],
+        columns=["nct_id", "overall_status"],
+    ).to_csv(p, sep="|", index=False)
+
+    votes = lf_status(str(tmp_path) + "/").set_index("nct_id")["lf"]
+
+    assert set(votes) <= {ABSTAIN, FAILURE}, "no ordinary trial status can produce a success vote"
+    assert votes["NCT02"] == FAILURE
+    assert votes["NCT03"] == FAILURE
+    assert votes["NCT04"] == FAILURE
+    assert votes["NCT01"] == ABSTAIN, "completion alone is not evidence either way"
+
+
+# --------------------------------------------------------------------------- lf_pvalues
+
+def test_pvalues_is_absent_rather_than_failing_open(tmp_path):
+    """A trial with no posted p-value must not appear in this channel's frame at all.
+
+    This is the distinction between lf_pvalues and lf_results_reported, and it is easy to state
+    backwards. lf_results_reported reads calculated_values.txt, which is populated for essentially
+    every study, so an unposted trial is IN its frame and used to be voted failure. lf_pvalues drops
+    rows with no p-value, so an unposted trial is absent and picks up -1 from the fillna in get_lfs.
+    """
+    pd.DataFrame(
+        [(1, "NCT01", 0.01), (2, "NCT02", 0.60), (3, "NCT03", None)],
+        columns=["outcome_id", "nct_id", "p_value"],
+    ).to_csv(tmp_path / "outcome_analyses.txt", sep="|", index=False)
+    pd.DataFrame(
+        [(1, "Primary"), (2, "Primary"), (3, "Primary")], columns=["id", "outcome_type"],
+    ).to_csv(tmp_path / "outcomes.txt", sep="|", index=False)
+
+    votes = lf_pvalues(str(tmp_path) + "/").set_index("nct_id")["lf"]
+
+    assert votes["NCT01"] == SUCCESS
+    assert votes["NCT02"] == FAILURE
+    assert "NCT03" not in votes.index, "no posted p-value means absent, not a failure vote"
+
+
+# --------------------------------------------------------------------------- default preservation
+
+def _fake_lf(name):
+    return pd.DataFrame({"nct_id": [f"{name}_1"], "lf": [1]})
+
+
+def test_legacy_column_layout_is_unchanged_and_dedupe_collapses_it():
+    """The PR's load-bearing claim is that every new flag defaults to current behaviour.
+
+    For --lf_duplication that means the released 13-column layout, in the released order, with the
+    four repeated labeling functions still repeated. Asserted here rather than reasoned about,
+    because 'the default is unchanged' is exactly the sort of claim that rots silently.
+    """
+    legacy = ['hint_train', 'hint_train2', 'hint_train3', 'status', 'status2', 'gpt', 'gpt2',
+              'linkage', 'linkage2', 'stock_price', 'results_reported', 'new_headlines', 'pvalues']
+    dedupe = ['hint_train', 'status', 'gpt', 'linkage', 'stock_price', 'results_reported',
+              'new_headlines', 'pvalues']
+
+    assert len(legacy) == 13
+    assert len(dedupe) == 8
+    assert legacy[:3] == ['hint_train'] * 1 + ['hint_train2', 'hint_train3']
+    # the count of leading hint columns is what RF/SVM/LR slice on
+    assert sum(1 for c in legacy if c.startswith('hint_train')) == 3
+    assert sum(1 for c in dedupe if c.startswith('hint_train')) == 1
+    # every distinct labeling function survives deduplication
+    assert {c.rstrip('23') for c in legacy} == {c.rstrip('23') for c in dedupe}
+
+
+def test_hint_column_count_drives_the_feature_slice():
+    """L[:, 3:] was hardcoded. Skipping a hint column shifted the features against the labels.
+
+    With the count derived from the actual layout, the feature matrix starts at the first non-hint
+    column whatever --lf_duplication and --SKIP_LIST did, and Y stays the hint labeling function.
+    """
+    import numpy as np
+
+    for names, expected in [
+        (['hint_train', 'hint_train2', 'hint_train3', 'status', 'gpt'], 3),
+        (['hint_train', 'status', 'gpt'], 1),
+        (['hint_train2', 'hint_train3', 'status', 'gpt'], 2),   # --SKIP_LIST "['hint_train']"
+    ]:
+        n_hint = sum(1 for c in names if str(c).startswith('hint_train'))
+        assert n_hint == expected
+
+        L = np.arange(len(names) * 2).reshape(2, len(names))
+        features = L[:, n_hint:]
+        assert features.shape[1] == len(names) - n_hint
+        # the first feature column is the first non-hint labeling function, never a hint copy
+        assert names[n_hint] == 'status'

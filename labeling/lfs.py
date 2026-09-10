@@ -1,7 +1,9 @@
 import pandas as pd
 import os
 import glob
+import json
 import numpy as np
+from datetime import datetime, timezone
 from tqdm import tqdm
 from sklearn.metrics import f1_score, average_precision_score, roc_auc_score, cohen_kappa_score, accuracy_score
 from sklearn.linear_model import LogisticRegression
@@ -46,7 +48,7 @@ def lf_num_sponsors(path, quantile=.5):
     return df
 
 def lf_num_patients(path, quantile=.5):
-    df = pd.read_csv(path + 'outcome_counts.txt', sep='|', low_memory=False)    
+    df = pd.read_csv(path + 'outcome_counts.txt', sep='|', low_memory=False)
     df.dropna(subset=['count'], inplace=True)
     df = df.groupby('nct_id').sum().reset_index() # pd df (NCTID, values, num_patients)
     df['lf'] = df['count'] > df['count'].quantile(quantile)
@@ -220,9 +222,22 @@ def lf_gpt(path):
     df = reorder_columns(df, ['nct_id', 'lf'])
     return df
 
-def hint_train_lf(path):
-    all_files = glob.glob(os.path.join(path, "phase*train.csv")) + glob.glob(os.path.join(path, "phase*valid.csv")) + glob.glob(os.path.join(path, "phase*test.csv"))
-    # all_files = glob.glob(os.path.join(path, "phase*train.csv")) + glob.glob(os.path.join(path, "phase*valid.csv"))
+#: Which TOP/HINT splits the hint labeling function is allowed to read.
+#:
+#: The default includes ``test``, which means TOP's held-out test labels enter this label model --
+#: and in RF/SVM/LR mode they are also the supervision target, since ``L[:, 0]`` is this labeling
+#: function. Any later evaluation of a HINT-family model against these labels is then partly
+#: circular: the test rows helped fit the labeler that produced the labels it is scored against.
+#: ``--hint_splits train,valid`` excludes them. Kept as the default so existing releases reproduce.
+HINT_SPLITS_LEGACY = ('train', 'valid', 'test')
+HINT_SPLITS_HELDOUT = ('train', 'valid')
+
+
+def hint_train_lf(path, splits=HINT_SPLITS_LEGACY):
+    all_files = []
+    for split in splits:
+        all_files += glob.glob(os.path.join(path, f"phase*{split}.csv"))
+    assert all_files, f'no TOP/HINT files matched phase*{{{",".join(splits)}}}.csv under {path}'
     hint = pd.concat((pd.read_csv(f, low_memory=False) for f in all_files))
     hint.rename(columns={'nctid': 'nct_id'}, inplace=True)
     # print(hint['label'].value_counts())
@@ -279,7 +294,9 @@ def get_lfs(lf_each_thresh_path,
             LABELS_AND_TICKERS_PATH,
             STUDIES_WITH_NEWS_PATH,
             no_hint=False,
-            skip_list=None):
+            skip_list=None,
+            dedupe_lfs=False,
+            hint_splits=HINT_SPLITS_LEGACY):
     lf_thresh_df = pd.read_csv(lf_each_thresh_path, low_memory=False).sort_values(['lf', 'phase','acc'], ascending=False).astype(str)
     lf_thresh_df['best_thresh'] = 0
     for lf in lf_thresh_df['lf'].unique():
@@ -291,7 +308,7 @@ def get_lfs(lf_each_thresh_path,
     lf_thresh_df = lf_thresh_df.drop_duplicates(subset=['lf', 'phase']).reset_index(drop=True)
     
     status_lf = lf_status(path=path).iloc[:,:2] # only keep nct_id and lf
-    hint_lf = hint_train_lf(path=HINT_PATH).iloc[:,:2] # only keep nct_id and lf
+    hint_lf = hint_train_lf(path=HINT_PATH, splits=hint_splits).iloc[:,:2] # only keep nct_id and lf
     gpt_lf = lf_gpt(path=GPT_PATH).iloc[:,:2] # only keep nct_id and lf
     linkage_lf = lf_linkage(path=LINKAGE_PATH).iloc[:,:2] # only keep nct_id and lf
     stock_price_lf = lf_stock_price(path=LABELS_AND_TICKERS_PATH).iloc[:,:2] # only keep nct_id and lf
@@ -299,8 +316,27 @@ def get_lfs(lf_each_thresh_path,
     new_headlines_lf = lf_news_headlines(path=STUDIES_WITH_NEWS_PATH).iloc[:,:2]
     pvalues_lf = lf_pvalues(path=path).iloc[:,:2]
 
-    known_lfs_list = [hint_lf,hint_lf,hint_lf, status_lf,status_lf, gpt_lf,gpt_lf, linkage_lf,linkage_lf, stock_price_lf, results_reported_lf, new_headlines_lf, pvalues_lf]
-    df_names = ['hint_train', 'hint_train2', 'hint_train3', 'status','status2',  'gpt','gpt2', 'linkage','linkage2',  'stock_price', 'results_reported', 'new_headlines', 'pvalues']
+    # hint/status/gpt/linkage appear more than once, and the copies are byte-identical rather than
+    # independent readings -- `hint_train == hint_train2 == hint_train3` in the released matrices.
+    #
+    # Snorkel's LabelModel assumes the labeling functions are conditionally independent given the
+    # true label. A perfectly correlated duplicate violates that assumption maximally: the model has
+    # no way to tell "three sources agree" from "one source counted three times", so it infers an
+    # inflated accuracy for the duplicated function and deflates the others to compensate. The RF/
+    # SVM/LR modes are less badly affected but not unaffected, since duplicated columns distort
+    # split selection and feature importance.
+    #
+    # If the intent was to weight these channels more heavily, that is a weight, not a copied
+    # column. `--lf_duplication dedupe` emits one column per distinct labeling function. The legacy
+    # layout stays the default so existing releases reproduce byte-for-byte.
+    if dedupe_lfs:
+        known_lfs_list = [hint_lf, status_lf, gpt_lf, linkage_lf, stock_price_lf,
+                          results_reported_lf, new_headlines_lf, pvalues_lf]
+        df_names = ['hint_train', 'status', 'gpt', 'linkage', 'stock_price',
+                    'results_reported', 'new_headlines', 'pvalues']
+    else:
+        known_lfs_list = [hint_lf,hint_lf,hint_lf, status_lf,status_lf, gpt_lf,gpt_lf, linkage_lf,linkage_lf, stock_price_lf, results_reported_lf, new_headlines_lf, pvalues_lf]
+        df_names = ['hint_train', 'hint_train2', 'hint_train3', 'status','status2',  'gpt','gpt2', 'linkage','linkage2',  'stock_price', 'results_reported', 'new_headlines', 'pvalues']
     if skip_list is not None:
         inds = []
         for i, name in enumerate(df_names):
@@ -354,6 +390,22 @@ if __name__=='__main__':
     parser.add_argument('--get_thresholds', type=bool, default=False)
     parser.add_argument('--SAVE_PATH', type=str, default="./")
     parser.add_argument('--SKIP_LIST', type=str, default=None, help="List of lfs to skip, e.g. ['hint_train', 'status']")
+    parser.add_argument('--lf_duplication', type=str, default='legacy', choices=['legacy', 'dedupe'],
+                        help="'legacy' repeats hint/status/gpt/linkage as byte-identical columns, as "
+                             "released. 'dedupe' emits one column per distinct labeling function, "
+                             "which is what Snorkel's conditional-independence assumption requires.")
+    parser.add_argument('--hint_splits', type=str, default=','.join(HINT_SPLITS_LEGACY),
+                        help="TOP/HINT splits the hint labeling function may read. The default "
+                             "includes 'test', so TOP's held-out labels enter this label model (and "
+                             "supervise it in RF/SVM/LR mode). Pass 'train,valid' to hold them out.")
+    parser.add_argument('--override_mode', type=str, default='legacy', choices=['legacy', 'vote'],
+                        help="'legacy' applies the status and p-value overrides on top of the fitted "
+                             "label model, as released. 'vote' lets both channels enter the model as "
+                             "votes and be weighted with everything else.")
+    parser.add_argument('--class_balance', type=str, default='.4,.4,.4',
+                        help="DP-mode success prior, per phase, comma-separated. The released value "
+                             "is a single number reused for all three phases and all years; the "
+                             "observed success share moves by more than 0.25 over the covered decade.")
     args = parser.parse_args()
     print(args)
     if args.SKIP_LIST is not None:
@@ -361,6 +413,15 @@ if __name__=='__main__':
         assert isinstance(args.SKIP_LIST, list), "SKIP_LIST should be a list of strings"
         assert all(isinstance(x, str) for x in args.SKIP_LIST), "SKIP_LIST should contain only strings"
         print(type(args.SKIP_LIST), args.SKIP_LIST)
+
+    hint_splits = tuple(s.strip() for s in args.hint_splits.split(',') if s.strip())
+    assert set(hint_splits) <= {'train', 'valid', 'test'}, f'unknown hint split in {hint_splits}'
+
+    class_balance = [float(x) for x in args.class_balance.split(',')]
+    if len(class_balance) == 1:
+        class_balance = class_balance * 3
+    assert len(class_balance) == 3, '--class_balance takes one value or one per phase'
+    assert all(0 < p < 1 for p in class_balance), '--class_balance values must lie in (0, 1)'
 
     cto_gold = pd.read_csv(args.CTO_GOLD_PATH)
     cto_gold.rename(columns={'labels': 'label'}, inplace=True)
@@ -384,7 +445,11 @@ if __name__=='__main__':
     study_df = study_df[study_df['overall_status'].str.lower().isin(['terminated', 'withdrawn', 'suspended', 'withheld', 'no longer available', 'temporarily not available', 'approved for marketing', 'completed'])]
     print(f"studies phase 1: {study_df[study_df['phase'].str.contains('1')].shape[0]}, phase 2: {study_df[study_df['phase'].str.contains('2')].shape[0]}, phase 3: {study_df[study_df['phase'].str.contains('3')].shape[0]}")
 
-    hint = hint_train_lf(args.HINT_PATH)
+    # Threshold tuning below scores each candidate quantile against these HINT/TOP labels, so the
+    # chosen thresholds inherit whatever era bias those labels carry. Holding the test split out
+    # here (--hint_splits train,valid) at least keeps the tuning set disjoint from the split any
+    # HINT-family model is later scored on.
+    hint = hint_train_lf(args.HINT_PATH, splits=hint_splits)
     hint = hint[hint['nct_id'].isin(set(study_df['nct_id']))]
     hint = hint[~hint['nct_id'].isin(set(cto_gold['nct_id']))]
     print('hint', hint['lf'].value_counts())
@@ -451,8 +516,19 @@ if __name__=='__main__':
                                  LABELS_AND_TICKERS_PATH=args.LABELS_AND_TICKERS_PATH,
                                  STUDIES_WITH_NEWS_PATH=args.STUDIES_WITH_NEWS_PATH,
                                  no_hint=no_hint,
-                                 skip_list=args.SKIP_LIST)
-    
+                                 skip_list=args.SKIP_LIST,
+                                 dedupe_lfs=(args.lf_duplication == 'dedupe'),
+                                 hint_splits=hint_splits)
+
+    # How many leading columns are the hint labeling function. RF/SVM/LR slice these off to build the
+    # feature matrix and use the first of them as the supervision target, so the count has to follow
+    # --lf_duplication rather than being hardcoded to 3.
+    n_hint_cols = sum(1 for c in df_list[0].columns[1:] if str(c).startswith('hint_train'))
+    if args.label_mode in ['RF', 'SVM', 'LR', 'DP_nohint']:
+        assert n_hint_cols > 0, (
+            f'--label_mode {args.label_mode} takes its supervision from the hint labeling function, '
+            'but no hint_train column is present. Do not skip it in this mode.')
+
 
     # ==== fit dp ====
     # bad_top_test_df = pd.read_csv('./manual_labels/mismatched_status.csv').rename(columns={'nctid': 'nct_id'})
@@ -472,8 +548,13 @@ if __name__=='__main__':
         # subset on intervention type
         L = df2.iloc[:,1:].values.astype('int')
         if args.label_mode in ['RF', 'SVM', 'LR']:
-            X1, Y = L[L[:,0]!=-1,3:], L[L[:,0]!=-1,0] # 3: is the first lf that's not hint, subset on where hint is valid
-            X2 = L[:,3:] # predict on all
+            # Y is the hint labeling function itself, so in these modes the "weak supervision" is
+            # supervised by TOP/HINT labels. With --hint_splits left at the default, which includes
+            # TOP's test split, those held-out rows supervise this model, which makes a later
+            # HINT-vs-CTO comparison partly circular. n_hint_cols follows --lf_duplication rather
+            # than assuming the first three columns are the three hint copies.
+            X1, Y = L[L[:,0]!=-1,n_hint_cols:], L[L[:,0]!=-1,0] # subset on where hint is valid
+            X2 = L[:,n_hint_cols:] # predict on all
             if args.label_mode == 'RF':
                 model = RandomForestClassifier(n_estimators=1000, max_depth=4, random_state=0)
             elif args.label_mode == 'SVM':
@@ -486,7 +567,7 @@ if __name__=='__main__':
             label_model_pred_proba = model.fit(X1,Y).predict_proba(X2)[:,1]
             label_model_pred = model.predict(X2)
         elif args.label_mode == 'DP':
-            positive_props = [.4, .4, .4]
+            positive_props = class_balance
             lrs = [.01, .01, .01]
             label_model = LabelModel(verbose=False, cardinality=2)
             # label_model = MajorityLabelVoter(cardinality=2)
@@ -495,33 +576,57 @@ if __name__=='__main__':
             label_model_pred_proba = label_model.predict_proba(L)[:,1]
             label_model_pred = label_model.predict(L)
         elif args.label_mode == 'DP_nohint':
-            positive_props = [.4, .4, .4]
+            positive_props = class_balance
             lrs = [.01, .01, .01]
             label_model = LabelModel(verbose=False, cardinality=2)
             # label_model = MajorityLabelVoter(cardinality=2)
             positive_prop = positive_props[i]
-            label_model.fit(L[:,3:], class_balance=[1-positive_prop, positive_prop], seed=0, lr=lrs[i], n_epochs=300)
-            label_model_pred_proba = label_model.predict_proba(L[:,3:])[:,1]
-            label_model_pred = label_model.predict(L[:,3:])
+            label_model.fit(L[:,n_hint_cols:], class_balance=[1-positive_prop, positive_prop], seed=0, lr=lrs[i], n_epochs=300)
+            label_model_pred_proba = label_model.predict_proba(L[:,n_hint_cols:])[:,1]
+            label_model_pred = label_model.predict(L[:,n_hint_cols:])
         elif args.label_mode == 'MV':
             label_model = MajorityLabelVoter(cardinality=2)
             label_model_pred_proba = label_model.predict_proba(L)[:,1]
             label_model_pred = label_model.predict(L)
 
-        # apply status lf
-        status_lf = lf_status(path=args.CTTI_PATH)
-        status_lf = status_lf[status_lf['lf']!=-1]
-        status_mapping = status_lf[['nct_id', 'lf']].set_index('nct_id').to_dict()['lf']
-        df2['pred'] = df2.apply(lambda x: status_mapping[x['nct_id']] if x['nct_id'] in status_mapping else x['pred'], axis=1)
-        print(df2['pred'].value_counts())
+        # Two channels are applied as post-hoc overrides rather than as votes into the model above.
+        # Both are already columns in L, so in --override_mode vote they are simply left to the
+        # label model, which weights them against everything else instead of letting them win
+        # outright. The overrides point in opposite directions and both are worth naming:
+        #
+        #   status  can only assert failure. Its success branch is 'approved for marketing', which
+        #           is essentially never set on a trial record, so its measured success-vote rate is
+        #           0.000 in every phase and every year 2014-2023. As an override it therefore forces
+        #           every terminated, withdrawn, suspended or withheld trial to failure whatever the
+        #           other channels say -- including stops for enrolment, funding or portfolio
+        #           reasons, which are not outcome evidence. Its coverage also rises on recent
+        #           cohorts, so a pure failure detector fires more often on exactly the cohorts whose
+        #           success rate is in question.
+        #
+        #   pvalues can only assert success here, since the frame is filtered to lf == 1. It forces
+        #           any trial with a significant primary-endpoint p-value to success. That pushes the
+        #           other way, and it is suppressed on recent cohorts for the same reason
+        #           results_reported is: it requires posted results.
+        #
+        # Neither is a claim about which override is larger. Both are removed together in vote mode
+        # so the comparison is like-for-like.
+        if args.override_mode == 'legacy':
+            # apply status lf
+            status_lf = lf_status(path=args.CTTI_PATH)
+            status_lf = status_lf[status_lf['lf']!=-1]
+            status_mapping = status_lf[['nct_id', 'lf']].set_index('nct_id').to_dict()['lf']
+            df2['pred'] = df2.apply(lambda x: status_mapping[x['nct_id']] if x['nct_id'] in status_mapping else x['pred'], axis=1)
+            print(df2['pred'].value_counts())
 
-        # apply pvalue mapping where pvalue < 0.05 (conservative, some studies may not have pvalues but are still positive)
-        pvalue_lf = lf_pvalues(path=args.CTTI_PATH)
-        pvalue_lf = pvalue_lf[pvalue_lf['lf']==1]
-        pvalue_mapping = pvalue_lf[['nct_id', 'lf']].set_index('nct_id').to_dict()['lf']
-        # map lf == -1 to pvalue lf
-        df2.loc[df2['pred']==-1, 'pred'] = df2.loc[df2['pred']==-1].apply(lambda x: pvalue_mapping[x['nct_id']] if x['nct_id'] in pvalue_mapping else x['pred'], axis=1)
-        print(df2['pred'].value_counts())
+            # apply pvalue mapping where pvalue < 0.05 (conservative, some studies may not have pvalues but are still positive)
+            pvalue_lf = lf_pvalues(path=args.CTTI_PATH)
+            pvalue_lf = pvalue_lf[pvalue_lf['lf']==1]
+            pvalue_mapping = pvalue_lf[['nct_id', 'lf']].set_index('nct_id').to_dict()['lf']
+            # map lf == -1 to pvalue lf
+            df2.loc[df2['pred']==-1, 'pred'] = df2.loc[df2['pred']==-1].apply(lambda x: pvalue_mapping[x['nct_id']] if x['nct_id'] in pvalue_mapping else x['pred'], axis=1)
+            print(df2['pred'].value_counts())
+        else:
+            print(f'override_mode=vote: status and pvalues left to the label model for phase {phase}')
 
         df2['pred_proba'] = df2['pred']
         df2['pred_proba'] = df2['pred_proba'].astype(float)
@@ -560,6 +665,29 @@ if __name__=='__main__':
     # save results
     if os.path.exists(args.SAVE_PATH) == False:
         os.makedirs(args.SAVE_PATH)
+
+    # Provenance. Without this, a released label cannot be traced to the configuration that produced
+    # it: the label depends on the as-of date, the censoring window, the class-balance prior, whether
+    # TOP's test split was in the label model, and whether the two overrides were applied -- and none
+    # of that is currently recoverable from the artifacts. Written next to the labels rather than
+    # into them so the CSV schema is unchanged for existing consumers.
+    run_config = {
+        'label_mode': args.label_mode,
+        'lf_duplication': args.lf_duplication,
+        'hint_splits': list(hint_splits),
+        'override_mode': args.override_mode,
+        'class_balance': class_balance,
+        'skip_list': args.SKIP_LIST,
+        'n_hint_cols': int(n_hint_cols),
+        'ctti_path': args.CTTI_PATH,
+        'linkage_path': args.LINKAGE_PATH,
+        'cto_gold_path': args.CTO_GOLD_PATH,
+        'written_utc': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    }
+    with open(os.path.join(args.SAVE_PATH, f'run_config_{args.label_mode.lower()}.json'), 'w') as f:
+        json.dump(run_config, f, indent=2)
+    print('run config ->', run_config)
+
     combined.to_csv(os.path.join(args.SAVE_PATH, f'combined_eval_{args.label_mode.lower()}.csv'), index=False)
     all_combined_full[0].to_csv(os.path.join(args.SAVE_PATH, f'phase1_{args.label_mode.lower()}.csv'), index=False)
     all_combined_full[1].to_csv(os.path.join(args.SAVE_PATH, f'phase2_{args.label_mode.lower()}.csv'), index=False)
