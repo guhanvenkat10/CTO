@@ -8,8 +8,10 @@ from tqdm import tqdm
 import json
 import os
 from datetime import timedelta
-from sentence_transformers import CrossEncoder
 import argparse
+# sentence_transformers is imported at the entry point rather than here. The cross-encoder is only
+# ever constructed in __main__ and passed in as an argument, and importing it at module scope pulls
+# in torch, which means nothing in this file can be imported or tested without a full GPU stack.
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -72,7 +74,55 @@ def match_FDA_approval_to_trials(approval_dict, similar_trials,cross_encoder):
     return matched_trials_applicant
 
 
-def match_FDA_approvals_main(save_path,merged_all_pd_path,cross_encoder,dev=False):
+# Days a Phase 3 trial is allowed, after primary completion, for a first-ever Orange Book entry
+# to plausibly appear. Used only to flag censored rows, never to change a label. The default is
+# deliberately conservative relative to observed NDA review timelines.
+DEFAULT_APPROVAL_LAG_ALLOWANCE_DAYS = 730
+
+
+def completion_date_map(trial_info):
+    """{nctid: completion_date} from the trial_info dict, which nests fields one level deep."""
+    out = {}
+    for nctid, rec in trial_info.items():
+        if not isinstance(rec, dict):
+            continue
+        value = rec.get('completion_date')
+        if value is None:
+            for sub in rec.values():
+                if isinstance(sub, dict) and sub.get('completion_date') is not None:
+                    value = sub['completion_date']
+                    break
+        if value is not None:
+            out[nctid] = value
+    return out
+
+
+def annotate_approval_censoring(merged_all_pd, completion_dates, orange_book_horizon,
+                                approval_lag_allowance_days=DEFAULT_APPROVAL_LAG_ALLOWANCE_DAYS):
+    """Flag the rows for which absence of an approval is uninformative, and record why.
+
+    Adds three columns and changes no outcome. A trial completing within
+    ``approval_lag_allowance_days`` of the snapshot horizon has not had time to produce a first-ever
+    Orange Book entry, so "no approval found" cannot be distinguished from "no approval could have
+    been found yet". A trial whose completion date is unknown is left unflagged rather than guessed.
+
+    Kept separate from match_FDA_approvals_main so it can be tested without the cross-encoder, the
+    Orange Book dump or the linkage adjacency matrices -- none of which are in the repository.
+    """
+    df = merged_all_pd.copy()
+    horizon = pd.Timestamp(orange_book_horizon)
+    cutoff = horizon - pd.Timedelta(days=int(approval_lag_allowance_days))
+
+    completion = pd.to_datetime(df['nctid'].map(completion_dates), errors='coerce')
+    df['completion_date'] = completion.dt.strftime('%Y-%m-%d')
+    df['orange_book_horizon'] = horizon.strftime('%Y-%m-%d')
+    df['approval_lag_allowance_days'] = int(approval_lag_allowance_days)
+    df['approval_evidence_censored'] = (completion > cutoff).fillna(False).astype(bool)
+    return df
+
+
+def match_FDA_approvals_main(save_path,merged_all_pd_path,cross_encoder,dev=False,
+                             approval_lag_allowance_days=DEFAULT_APPROVAL_LAG_ALLOWANCE_DAYS):
     print('Reading the FDA approvals')
     # read the FDA approvals
     FDA_path = save_path.replace('clinical_trial_linkage/trial_linkages','FDA/FDA_new/products.txt')
@@ -170,11 +220,42 @@ def match_FDA_approvals_main(save_path,merged_all_pd_path,cross_encoder,dev=Fals
     # if true and outcome in merged_all_pd is not Success convert to Success
     # else leave it
     
+    matched_nctids = set(phase_3_fda_matched_df['nctid'].values)
     for i in range(merged_all_pd.shape[0]):
         nctid = merged_all_pd.iloc[i]['nctid']
-        if nctid in phase_3_fda_matched_df['nctid'].values:
+        if nctid in matched_nctids:
             if merged_all_pd.iloc[i]['outcome'] != 'Success':
                 merged_all_pd.at[i, 'outcome'] = 'Success'
+
+    # This channel is the one that actually assigns Phase 3 success, and it can only ever add
+    # successes -- there is no branch that adds a failure. So the horizon of the Orange Book
+    # snapshot is a hard bound on how much success evidence a cohort can show, and the bound bites
+    # hardest on the most recent trials, which have had the least time to produce an approval.
+    #
+    # `approval_evidence_censored` marks the trials for which "no approval found" cannot be
+    # distinguished from "no approval could have been found yet". It changes no label; it makes the
+    # limit legible to anyone reading the released file, which currently records neither the
+    # snapshot date nor the lag allowance.
+    #
+    # Two further limits that no flag can fix, and that belong next to any use of this channel:
+    # the Orange Book lists small molecules only, so every biologic is invisible to it, and a
+    # first-ever entry is required, so approval of an already-marketed drug for a new indication
+    # never registers here.
+    # The merged frame carries only nctid/outcome/phase/linkage columns, so completion dates come
+    # from trial_info, which is the same source the matching above uses.
+    orange_book_horizon = pd.to_datetime(orange_book['Approval_Date']).max()
+    merged_all_pd = annotate_approval_censoring(
+        merged_all_pd,
+        completion_dates=completion_date_map(trial_info),
+        orange_book_horizon=orange_book_horizon,
+        approval_lag_allowance_days=approval_lag_allowance_days,
+    )
+    n_censored = int(merged_all_pd['approval_evidence_censored'].sum())
+    n_unknown = int(merged_all_pd['completion_date'].isna().sum())
+    print(f'Orange Book horizon {orange_book_horizon:%Y-%m-%d}; '
+          f'{n_censored} trials completed within {approval_lag_allowance_days} d of it and are '
+          f'flagged approval_evidence_censored (their labels are unchanged); '
+          f'{n_unknown} trials have no completion date and are not flagged')
 
     # merge_all_save_path = merged_all_pd_path.split('.csv')[0] + '_FDA_updated.csv'
     merge_all_save_path = os.path.join(save_path, 'outcome_labels','Merged_all_trial_linkage_outcome_df__FDA_updated.csv' )
@@ -183,10 +264,18 @@ def match_FDA_approvals_main(save_path,merged_all_pd_path,cross_encoder,dev=Fals
     print('Finished updating merged_all_pd with FDA approvals')
     
 if __name__ == '__main__':
+    from sentence_transformers import CrossEncoder
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--save_path', type=str, default='', help='path to save the data')
     # parser.add_argument('--trial_linkage_path', type=str, default = None, help='Path to save the matched trials results (provide the path where the trial linkages results are saved)')
     parser.add_argument('--dev', action='store_true', help='Development mode')
+    parser.add_argument('--approval_lag_allowance_days', type=int,
+                        default=DEFAULT_APPROVAL_LAG_ALLOWANCE_DAYS,
+                        help='Days after primary completion within which a first-ever Orange '
+                             'Book entry could plausibly appear. Trials completing within this '
+                             'many days of the snapshot horizon are flagged '
+                             'approval_evidence_censored. Flag only; no label changes.')
     args = parser.parse_args()
     
     trial_linkage_path = os.path.join(args.save_path, 'clinical_trial_linkage/trial_linkages')
@@ -200,6 +289,7 @@ if __name__ == '__main__':
 
     
     print(f'Matching FDA approvals to trials and updating the merged_all_pd at {merged_all_pd_path}')
-    match_FDA_approvals_main(save_path,merged_all_pd_path,cross_encoder,dev=args.dev)
+    match_FDA_approvals_main(save_path,merged_all_pd_path,cross_encoder,dev=args.dev,
+                             approval_lag_allowance_days=args.approval_lag_allowance_days)
     
 # 4

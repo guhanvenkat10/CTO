@@ -47,6 +47,28 @@ def lf_num_sponsors(path, quantile=.5):
     df = reorder_columns(df, ['nct_id', 'lf'])
     return df
 
+# The five labeling functions below -- num_patients, patient_drop, death_ae, serious_ae, all_ae --
+# read the AACT *results* section (outcome_counts.txt, drop_withdrawals.txt,
+# reported_event_totals.txt). Those tables exist only for trials that posted results.
+#
+# They abstain correctly on everything else: an unposted trial is simply absent from the frame and
+# picks up -1 from `all_df.fillna(-1)` in get_lfs. So this is not the fail-open that
+# lf_results_reported was -- calculated_values.txt is populated for essentially every study, which is
+# why an unposted trial was IN that frame and could be voted failure.
+#
+# What these five do carry is a selection effect in the same direction. Results posting is due about
+# twelve months after completion and compliance is far from universal, so the subpopulation they can
+# see is strongly correlated with how long ago the trial completed. Two consequences worth being
+# explicit about:
+#
+#   1. Coverage on recent cohorts is structurally lower, so the aggregate leans on the channels that
+#      remain -- and among those, the ones that can still fire on a recent trial are the ones that
+#      read contemporaneous registry state.
+#   2. The threshold is `df['count'].quantile(q)` over the whole pooled frame, so a recent trial is
+#      being compared against a pool dominated by older trials, and the realised absolute threshold
+#      moves between releases as the frame grows. The value actually used is not currently recorded
+#      anywhere in the outputs, which is why the same code over the same registry snapshot can
+#      produce different labels at different times.
 def lf_num_patients(path, quantile=.5):
     df = pd.read_csv(path + 'outcome_counts.txt', sep='|', low_memory=False)
     df.dropna(subset=['count'], inplace=True)
