@@ -109,11 +109,38 @@ COMPLETED that becomes -0.023 / +0.043 / -0.031, every interval crossing zero.
 **Take these because the failure votes are unjustified — a trial with no posted results has not
 reported a failure, it has not reported — not because the benchmark improves.**
 
-One honest caveat: under DP the correction overshoots. Making `results_reported` abstain removes the
-highest-coverage channel almost entirely, and the resulting phase 3 success rate of 0.601 sits above
-a plausible true rate nearer 0.44-0.46. Censoring the undecidable rows instead of relabelling them
-keeps the base rate closer (0.498 against 0.602 in phase 2) and scores better on Brier and ECE,
-though it buys less discrimination.
+### On the overshoot, which we raised and then had to withdraw
+
+We previously flagged that this correction overshoots, on the grounds that it lifts the phase 3
+success rate to 0.601 against a plausible recent rate nearer 0.44-0.46. That comparison was not
+like-for-like and the objection does not survive it. 0.601 is the label rate over every trial in
+the matrix, across all years; 0.44-0.46 is an estimate for recent trials only.
+
+Restricted to the cohort the annotation actually covers, against the annotation's own success rate
+on the same trials:
+
+| phase | annotation | shipped labels | with this correction | gap |
+|---|---|---|---|---|
+| 1 | 0.1925 | 0.1442 | 0.0990 | **-0.094** |
+| 2 | 0.2951 | 0.2520 | 0.3045 | +0.009 |
+| 3 | 0.5233 | 0.4654 | 0.5223 | -0.001 |
+
+In phases 2 and 3 the corrected labels land on the annotation's own base rate, and closer to it than
+the shipped labels do. There is no overshoot to answer for there.
+
+Phase 1 is a real problem and goes the other way: the correction **undershoots** by 0.094. It is of a
+piece with everything else we saw in phase 1, where the DP labels are unstable — refitting on the
+patched matrix moves thousands of labels *against* the direction of the patch, which D1/D3/D4 cannot
+do by themselves since they only ever convert a failure vote to an abstention. We would not rely on
+phase 1 DP labels without looking at that first.
+
+We also tested a time-aware version of this fix, abstaining only inside the window where a posting
+could not yet be overdue under FDAAA 801, on the theory that a long-overdue missing posting is
+informative. It does not hold up: 12, 24 and 36 month windows all match the annotation's base rate
+worse than unconditional abstention in phases 2 and 3, and score worse downstream.
+
+Censoring the undecidable rows rather than relabelling them remains a reasonable alternative. It
+scores better on Brier and ECE than relabelling but buys less discrimination.
 
 ---
 
