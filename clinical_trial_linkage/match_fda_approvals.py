@@ -75,9 +75,16 @@ def match_FDA_approval_to_trials(approval_dict, similar_trials,cross_encoder):
 
 
 # Days a Phase 3 trial is allowed, after primary completion, for a first-ever Orange Book entry
-# to plausibly appear. Used only to flag censored rows, never to change a label. The default is
-# deliberately conservative relative to observed NDA review timelines.
-DEFAULT_APPROVAL_LAG_ALLOWANCE_DAYS = 730
+# to plausibly appear. Used only to flag censored rows, never to change a label.
+#
+# Measured the same way as the linkage windows: Phase 3 and Phase 2/3 trials with an actual primary
+# completion in 2014-2016 (a decade of follow-up, so observed lags are close to true ones), an
+# intervention whose first-ever Orange Book entry comes after completion, each first approval matched
+# to the closest preceding completion as in match_FDA_approvals_main. n = 55 matched first approvals:
+# lag median 534 days, 25th percentile 255, 75th 935, 90th 1,566. (2010-2016, n = 118: median 447.)
+# The default is the median, as for the linkage windows. The previous 730 covered 69% of matched
+# approvals. Pass --approval_lag_allowance_days 935 (75th) or 1566 (90th) for a stricter flag.
+DEFAULT_APPROVAL_LAG_ALLOWANCE_DAYS = 534
 
 
 def completion_date_map(trial_info):
@@ -101,7 +108,8 @@ def annotate_approval_censoring(merged_all_pd, completion_dates, orange_book_hor
                                 approval_lag_allowance_days=DEFAULT_APPROVAL_LAG_ALLOWANCE_DAYS):
     """Flag the rows for which absence of an approval is uninformative, and record why.
 
-    Adds three columns and changes no outcome. A trial completing within
+    Adds four columns (completion_date, orange_book_horizon, approval_lag_allowance_days,
+    approval_evidence_censored) and changes no outcome. A trial completing within
     ``approval_lag_allowance_days`` of the snapshot horizon has not had time to produce a first-ever
     Orange Book entry, so "no approval found" cannot be distinguished from "no approval could have
     been found yet". A trial whose completion date is unknown is left unflagged rather than guessed.

@@ -7,8 +7,14 @@ two pure functions and tested here.
     pytest clinical_trial_linkage/test_approval_censoring.py
 """
 
+import os
+import sys
+
 import pandas as pd
 import pytest
+
+# Importable when pytest is run from the repository root, not only from this folder.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from match_fda_approvals import (DEFAULT_APPROVAL_LAG_ALLOWANCE_DAYS, annotate_approval_censoring,
                                  completion_date_map)
