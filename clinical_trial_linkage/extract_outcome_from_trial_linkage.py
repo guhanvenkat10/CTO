@@ -35,6 +35,18 @@ def _censoring_window(phase, override=None):
     return DEFAULT_CENSORING_WINDOW_DAYS.get(phase, LEGACY_CENSORING_WINDOW_DAYS)
 
 
+def link_outcome(linked, positive_edge, completion_date, trial_phase, as_of_date, override=None):
+    """Linkage label for one trial. The censoring window is the window of the trial's OWN phase
+    (the phase being labeled), not of the next phase it would link to."""
+    window_days = _censoring_window(trial_phase, override)
+    censor_before = as_of_date - pd.Timedelta(days=window_days)
+    if linked and positive_edge:
+        return 'Success', window_days
+    if completion_date > censor_before:
+        return 'Recent trial', window_days
+    return ('Not sure' if linked else 'Failure'), window_days
+
+
 def get_trial_linkage_weak_outcome_labels(save_path, trial_linkage_path, as_of_date=None,
                                           censoring_window_days=None):
     if not os.path.exists(save_path):
@@ -179,36 +191,22 @@ def get_trial_linkage_weak_outcome_labels(save_path, trial_linkage_path, as_of_d
         # snapshot produced different labels and neither could be reproduced later.
         current_date = as_of_date if as_of_date is not None else datetime.now()
         current_date = datetime.strptime(current_date.strftime("%Y-%m-%d"), '%Y-%m-%d')
-        window_days = _censoring_window(phase, censoring_window_days)
-        censor_before = current_date - pd.Timedelta(days=window_days)
-        print(f'  as-of date {current_date:%Y-%m-%d}, censoring window {window_days} d '
-              f'(trials completing after {censor_before:%Y-%m-%d} are held as "Recent trial")')
+        windows_used = set()
 
         for i in tqdm(range(adj_matrix.shape[1])):
             trial = index_to_trial_map[f'{phase} connected'][i]
             trial_linkage_outcome_labels[trial] = {}
-            if np.sum(adj_matrix[:,i]) == 0:
-                #get completion date
-                trial_completion_date = trial_info[trial]['completion_date']
-                # convert to datetime
-                trial_completion_date = datetime.strptime(trial_completion_date, '%Y-%m-%d')
-                
-                if trial_completion_date > censor_before:
-                    trial_linkage_outcome_labels[trial]['outcome'] = 'Recent trial'
-                else:
-                    trial_linkage_outcome_labels[trial]['outcome'] = 'Failure'
-            elif any(edge_values[:,i] > 0):
-                trial_linkage_outcome_labels[trial]['outcome'] = 'Success'
-            else:
-                #get completion date
-                trial_completion_date = trial_info[trial]['completion_date']
-                # convert to datetime
-                trial_completion_date = datetime.strptime(trial_completion_date, '%Y-%m-%d')
-                
-                if trial_completion_date > censor_before:
-                    trial_linkage_outcome_labels[trial]['outcome'] = 'Recent trial'
-                else:
-                    trial_linkage_outcome_labels[trial]['outcome'] = 'Not sure'
+            # The window comes from the labeled trial's own phase. `phase` here is the target
+            # phase it would link to, which is why it must not be used for the lookup.
+            outcome, window_days = link_outcome(
+                linked=np.sum(adj_matrix[:,i]) > 0,
+                positive_edge=any(edge_values[:,i] > 0),
+                completion_date=datetime.strptime(trial_info[trial]['completion_date'], '%Y-%m-%d'),
+                trial_phase=trial_info[trial]['phase'],
+                as_of_date=current_date,
+                override=censoring_window_days)
+            trial_linkage_outcome_labels[trial]['outcome'] = outcome
+            windows_used.add((trial_info[trial]['phase'], window_days))
                 
             # get additional info (use connected phase)
             for ph in phase_connect[phase]:
@@ -233,6 +231,7 @@ def get_trial_linkage_weak_outcome_labels(save_path, trial_linkage_path, as_of_d
                     temp_dict = {'trial':index_to_trial_map[phase][index],'cross_encoder_score':edge_values[index,i]}
                     trial_linkage_outcome_labels[trial]['weakly connected next phase'].append(temp_dict)
                     
+        print(f'  as-of date {current_date:%Y-%m-%d}, censoring windows used (phase, days): {sorted(windows_used)}')
         # convert the outcome labels to a dataframe
         outcome_df = pd.DataFrame.from_dict(trial_linkage_outcome_labels,orient='index').reset_index()
         print(f'Saving outcome labels for {phase_names} of size {outcome_df.shape}')
@@ -261,6 +260,11 @@ def get_trial_linkage_weak_outcome_labels(save_path, trial_linkage_path, as_of_d
         trial_2_dict = phase1_df2[phase1_df2['nctid'] == trial]
 
         merge_dict[trial]['phase'] = trial_1_dict['phase'].iloc[0]
+        # Carry the provenance columns through the merge; both rows come from the same trial and
+        # the same run, so they must agree.
+        for col in ('as_of_date', 'censoring_window_days'):
+            assert trial_1_dict[col].iloc[0] == trial_2_dict[col].iloc[0], (trial, col)
+            merge_dict[trial][col] = trial_1_dict[col].iloc[0]
         
         if trial_1_dict['outcome'].iloc[0] == trial_2_dict['outcome'].iloc[0]:
             merge_dict[trial]['outcome'] = trial_1_dict['outcome'].iloc[0]
@@ -286,6 +290,12 @@ def get_trial_linkage_weak_outcome_labels(save_path, trial_linkage_path, as_of_d
                 merge_dict[trial]['outcome'] = trial_2_dict['outcome'].iloc[0]
                 merge_dict[trial]['connected next phase'] = eval(trial_2_dict['connected next phase'].iloc[0])
                 merge_dict[trial]['weakly connected next phase'] = eval(trial_2_dict['weakly connected next phase'].iloc[0])
+
+            else:
+                # With one window per trial, "Recent trial" cannot disagree between the two rows,
+                # so every disagreement is one of the pairs above. Anything else is a bug.
+                raise ValueError(f'unhandled outcome pair for {trial}: '
+                                 f'{trial_1_dict["outcome"].iloc[0]!r} / {trial_2_dict["outcome"].iloc[0]!r}')
                 
     merge_df = pd.DataFrame.from_dict(merge_dict, orient='index').reset_index()
     print(f'Saving merged Phase 1 and Early Phase 1 labels of size {merge_df.shape}')
