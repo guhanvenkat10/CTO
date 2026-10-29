@@ -37,31 +37,24 @@ inside COMPLETED, every interval crossing zero.
 
 ---
 
-## 1. `--override_mode vote` — the largest effect in this PR
+## 1. `--override_mode vote` — earlier headline withdrawn
 
-`legacy` applies the status and p-value overrides on top of the fitted label model. Wherever status
-fires, the other channels are discarded.
+An earlier version of this section, and my 9/21 email, said the status override discards outcome
+evidence inside COMPLETED trials and that a learned aggregation over the other channels gains
++0.11 to +0.16 AUROC there. **That claim is withdrawn.** A later audit found three problems with it:
 
-Measured: status is worth **0.5000** inside COMPLETED, and the channels it overrides are worth a
-great deal more. Fitting an aggregation over the distinct non-status channels, on annotated trials
-completing 2020-2021 and scoring on 2022 onward:
+- **The override does not fire inside COMPLETED.** `lf_status` abstains unless the status is a stop
+  reason, so for completed trials there is nothing for the override to discard. The comparison was
+  not measuring what the heading said.
+- **The baseline was not the released score.** The "released aggregation" column was a locally fitted
+  Snorkel DP labeler with the overrides, not the `pred_proba` CTO ships. Rerun against the released RF
+  `pred_proba`, the learned aggregation still ranks better on completed trials, but its **Brier score
+  and log loss are worse in every phase**, so it is not a reliable probabilistic improvement.
+- **"The released aggregation is unsupervised" was wrong.** RF mode is supervised by the TOP/HINT
+  labeling function; only DP mode is unsupervised.
 
-| phase | released aggregation | learned over non-status channels | delta (95% CI) |
-|---|---|---|---|
-| 1 | 0.6830 | 0.7949 | +0.113 [0.025, 0.199] |
-| 2 | 0.6240 | 0.7668 | +0.144 [0.063, 0.225] |
-| 3 | 0.6416 | 0.8011 | +0.160 [0.086, 0.233] |
-
-Checks run before believing this: refitting on shuffled training labels gives 0.469 / 0.474 /
-0.509; a model given only the status channel gives 0.5000 in all nine phase-by-boundary cells;
-deltas stay positive with intervals clear of zero at the 2020 and 2021 boundaries and stay positive
-at 2022, where the test slice falls to 120-224 rows and two of three lose significance on power.
-383 annotated trials already reach 0.781 in phase 1; 11,012 are available.
-
-**Caveat, stated because it matters.** The released aggregation is unsupervised and this comparison
-is not, so it is not like-for-like and should not be quoted as if it were. The defensible reading is
-narrower: the signal is present in the channels the override discards. It also concerns labelling
-rather than forecasting, since these votes use post-completion evidence.
+What still stands: `--override_mode` is exposed so the override's effect can be inspected, with
+`legacy` (the released behaviour) as the default. Nothing in this PR depends on the withdrawn number.
 
 ---
 
@@ -92,7 +85,10 @@ phase 3 is negative.
 
 ---
 
-## 3. The abstention fixes (D1 linkage, D3 results_reported, D4 gpt)
+## 3. The abstention fixes (D1 linkage, D3 results_reported, D4 gpt): `--lf_polarity abstain`
+
+All three are behind one switch, `--lf_polarity legacy|abstain`, with `legacy` the default so a fresh
+clone reproduces the release in every label mode. The polarity is written to `run_config`.
 
 Under `--label_mode RF` these change **nothing**, and the reason is the useful part. The released
 binary label in `phase{1,2,3}_CTO_rf.csv` is reproduced 100.0000% across all 131,160 rows by a
