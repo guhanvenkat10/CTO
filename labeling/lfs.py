@@ -23,18 +23,29 @@ def reorder_columns(df, cols_in_front):
     columns = cols_in_front + columns
     return df[columns]
 
-def lf_results_reported(path, abstain_when_unposted=True):
+#: Vote polarity for the three labeling functions whose "no evidence" case used to vote failure
+#: (lf_results_reported, lf_linkage, lf_gpt). 'legacy' reproduces the released labels exactly and is
+#: the default; 'abstain' makes those cases abstain. Selected with --lf_polarity and recorded in
+#: run_config, so every output file says which polarity produced it.
+LF_POLARITIES = ('legacy', 'abstain')
+
+
+def _check_polarity(polarity):
+    assert polarity in LF_POLARITIES, f'polarity must be one of {LF_POLARITIES}, got {polarity!r}'
+
+
+def lf_results_reported(path, polarity='legacy'):
     # Posted results are weak evidence of success; the ABSENCE of posted results is not evidence of
-    # failure. `were_results_reported == 'f'` previously produced a failure vote, and since the flag
-    # is populated for essentially every study this labeling function never abstained, so every
-    # trial that had not yet posted carried a failure vote. Results posting is due ~12 months after
-    # completion, is widely non-compliant, and is mechanically unavailable for recent trials, so
-    # that turned a documentation delay into a failure label. Pass abstain_when_unposted=False to
-    # restore the previous behaviour.
+    # failure. Under 'legacy', `were_results_reported == 'f'` produces a failure vote, and since the
+    # flag is populated for essentially every study the function never abstains, so every trial that
+    # has not yet posted carries a failure vote. Results posting is due ~12 months after completion,
+    # is widely non-compliant, and is mechanically unavailable for recent trials. 'abstain' votes
+    # -1 for unposted trials instead.
+    _check_polarity(polarity)
     df = pd.read_csv(path + 'calculated_values.txt', sep='|', low_memory=False)
     df.dropna(subset=['were_results_reported'], inplace=True)
     posted = df['were_results_reported'] == 't'
-    df['lf'] = np.where(posted, 1, -1 if abstain_when_unposted else 0).astype('int')
+    df['lf'] = np.where(posted, 1, -1 if polarity == 'abstain' else 0).astype('int')
     df = reorder_columns(df, ['nct_id', 'lf'])
     return df
 
@@ -180,13 +191,21 @@ def lf_stock_price(path):
     df = reorder_columns(df, ['nct_id', 'lf'])
     return df
     
-def lf_linkage(path):
-    # Abstain by default. extract_outcome_from_trial_linkage.py emits four outcome values, and the
-    # previous default of 0 meant 'Recent trial' -- the category it creates for trials that have not
-    # yet had time to link -- was read as a failure vote. Mapping every value explicitly makes an
-    # unhandled value fail loudly rather than silently become a failure.
+def lf_linkage(path, polarity='legacy'):
+    # extract_outcome_from_trial_linkage.py emits four outcome values. Under 'legacy' every value not
+    # listed (including 'Recent trial', the category it creates for trials that have not yet had time
+    # to link) votes 0, as in the release. Under 'abstain' every value is mapped explicitly, 'Recent
+    # trial' abstains, and an unhandled value fails loudly rather than silently becoming a failure.
+    _check_polarity(polarity)
     df = pd.read_csv(path, low_memory=False)
     df.rename(columns={'nctid': 'nct_id'}, inplace=True)
+    if polarity == 'legacy':
+        df['lf'] = 0
+        df.loc[df['outcome']=='Failure',['lf']] = 0
+        df.loc[df['outcome']=='Not sure',['lf']] = -1
+        df.loc[df['outcome']=='Success', ['lf']] = 1
+        df = reorder_columns(df, ['nct_id', 'lf'])
+        return df
     outcome_to_vote = {
         'Success': 1,
         'Failure': 0,
@@ -229,16 +248,17 @@ def lf_news_headlines(path):
     df = reorder_columns(df, ['nct_id', 'lf'])
     return df
            
-def lf_gpt(path):
+def lf_gpt(path, polarity='legacy'):
+    # 'Not sure' is the model declining to call the outcome. Under 'legacy' it votes failure, as in the
+    # release; under 'abstain' it votes -1. This matters more than it looks. Checked against the
+    # release input on HuggingFace, `pubmed_gpt_outcomes/pubmed_gpt_outcomes.csv` (56,737 rows):
+    # 'Success' 32,980, 'Not sure' 23,756, one row with no outcome, and no 'Failure' at all. So under
+    # the legacy mapping every failure vote this channel casts is the model saying it could not tell.
+    _check_polarity(polarity)
     df = pd.read_csv(path, low_memory=False)
-    df['outcome'].unique()
-    # 'Not sure' is the model declining to call the outcome, so it abstains rather than voting
-    # failure. This matters more than it looks: in the released pubmed_gpt_outcomes.csv the model
-    # returns only 'Success' (32,980) and 'Not sure' (23,756) and never 'Failure', so under the
-    # previous mapping 100% of this channel's failure votes were the model saying it could not tell.
     df['lf'] = -1
     df.loc[df['outcome']=='Success', ['lf']] = 1
-    df.loc[df['outcome']=='Not sure',['lf']] = -1
+    df.loc[df['outcome']=='Not sure',['lf']] = -1 if polarity == 'abstain' else 0
     df.loc[df['outcome']=='Failure', ['lf']] = 0
     df.rename(columns={'nctid': 'nct_id'}, inplace=True)
     df = reorder_columns(df, ['nct_id', 'lf'])
@@ -308,6 +328,29 @@ def get_lfs_by_name(func_name, quantile,
         print('func_name not found', func_name)
         return None
 
+def lf_column_names(dedupe_lfs=False):
+    """Column layout of the vote matrix. The legacy layout repeats hint/status/gpt/linkage as
+    byte-identical columns, in the released order; dedupe emits one column per distinct function."""
+    if dedupe_lfs:
+        return ['hint_train', 'status', 'gpt', 'linkage', 'stock_price',
+                'results_reported', 'new_headlines', 'pvalues']
+    return ['hint_train', 'hint_train2', 'hint_train3', 'status', 'status2', 'gpt', 'gpt2', 'linkage', 'linkage2',
+            'stock_price', 'results_reported', 'new_headlines', 'pvalues']
+
+
+def count_hint_cols(columns):
+    """Number of leading hint_train columns; follows --lf_duplication and --SKIP_LIST, never hardcoded."""
+    return sum(1 for c in columns if str(c).startswith('hint_train'))
+
+
+def split_hint_supervision(L, columns):
+    """RF/SVM/LR take their supervision from the leading hint_train column(s) and their features from
+    everything after them. Returns (n_hint_cols, X_train, Y_train, X_all)."""
+    n_hint_cols = count_hint_cols(columns)
+    valid = L[:, 0] != -1
+    return n_hint_cols, L[valid, n_hint_cols:], L[valid, 0], L[:, n_hint_cols:]
+
+
 def get_lfs(lf_each_thresh_path,
             path, 
             HINT_PATH,
@@ -318,7 +361,8 @@ def get_lfs(lf_each_thresh_path,
             no_hint=False,
             skip_list=None,
             dedupe_lfs=False,
-            hint_splits=HINT_SPLITS_LEGACY):
+            hint_splits=HINT_SPLITS_LEGACY,
+            lf_polarity='legacy'):
     lf_thresh_df = pd.read_csv(lf_each_thresh_path, low_memory=False).sort_values(['lf', 'phase','acc'], ascending=False).astype(str)
     lf_thresh_df['best_thresh'] = 0
     for lf in lf_thresh_df['lf'].unique():
@@ -331,10 +375,10 @@ def get_lfs(lf_each_thresh_path,
     
     status_lf = lf_status(path=path).iloc[:,:2] # only keep nct_id and lf
     hint_lf = hint_train_lf(path=HINT_PATH, splits=hint_splits).iloc[:,:2] # only keep nct_id and lf
-    gpt_lf = lf_gpt(path=GPT_PATH).iloc[:,:2] # only keep nct_id and lf
-    linkage_lf = lf_linkage(path=LINKAGE_PATH).iloc[:,:2] # only keep nct_id and lf
+    gpt_lf = lf_gpt(path=GPT_PATH, polarity=lf_polarity).iloc[:,:2] # only keep nct_id and lf
+    linkage_lf = lf_linkage(path=LINKAGE_PATH, polarity=lf_polarity).iloc[:,:2] # only keep nct_id and lf
     stock_price_lf = lf_stock_price(path=LABELS_AND_TICKERS_PATH).iloc[:,:2] # only keep nct_id and lf
-    results_reported_lf = lf_results_reported(path=path).iloc[:,:2] # only keep nct_id and lf
+    results_reported_lf = lf_results_reported(path=path, polarity=lf_polarity).iloc[:,:2] # only keep nct_id and lf
     new_headlines_lf = lf_news_headlines(path=STUDIES_WITH_NEWS_PATH).iloc[:,:2]
     pvalues_lf = lf_pvalues(path=path).iloc[:,:2]
 
@@ -351,14 +395,11 @@ def get_lfs(lf_each_thresh_path,
     # If the intent was to weight these channels more heavily, that is a weight, not a copied
     # column. `--lf_duplication dedupe` emits one column per distinct labeling function. The legacy
     # layout stays the default so existing releases reproduce byte-for-byte.
-    if dedupe_lfs:
-        known_lfs_list = [hint_lf, status_lf, gpt_lf, linkage_lf, stock_price_lf,
-                          results_reported_lf, new_headlines_lf, pvalues_lf]
-        df_names = ['hint_train', 'status', 'gpt', 'linkage', 'stock_price',
-                    'results_reported', 'new_headlines', 'pvalues']
-    else:
-        known_lfs_list = [hint_lf,hint_lf,hint_lf, status_lf,status_lf, gpt_lf,gpt_lf, linkage_lf,linkage_lf, stock_price_lf, results_reported_lf, new_headlines_lf, pvalues_lf]
-        df_names = ['hint_train', 'hint_train2', 'hint_train3', 'status','status2',  'gpt','gpt2', 'linkage','linkage2',  'stock_price', 'results_reported', 'new_headlines', 'pvalues']
+    by_name = {'hint_train': hint_lf, 'status': status_lf, 'gpt': gpt_lf, 'linkage': linkage_lf,
+               'stock_price': stock_price_lf, 'results_reported': results_reported_lf,
+               'new_headlines': new_headlines_lf, 'pvalues': pvalues_lf}
+    df_names = lf_column_names(dedupe_lfs)
+    known_lfs_list = [by_name[n.rstrip('23')] for n in df_names]
     if skip_list is not None:
         inds = []
         for i, name in enumerate(df_names):
@@ -420,6 +461,9 @@ if __name__=='__main__':
                         help="TOP/HINT splits the hint labeling function may read. The default "
                              "includes 'test', so TOP's held-out labels enter this label model (and "
                              "supervise it in RF/SVM/LR mode). Pass 'train,valid' to hold them out.")
+    parser.add_argument('--lf_polarity', type=str, default='legacy', choices=list(LF_POLARITIES),
+                        help="'legacy' reproduces the released labels (unposted results, linkage 'Recent "
+                             "trial' and GPT 'Not sure' vote failure); 'abstain' makes those cases abstain.")
     parser.add_argument('--override_mode', type=str, default='legacy', choices=['legacy', 'vote'],
                         help="'legacy' applies the status and p-value overrides on top of the fitted "
                              "label model, as released. 'vote' lets both channels enter the model as "
@@ -540,12 +584,13 @@ if __name__=='__main__':
                                  no_hint=no_hint,
                                  skip_list=args.SKIP_LIST,
                                  dedupe_lfs=(args.lf_duplication == 'dedupe'),
-                                 hint_splits=hint_splits)
+                                 hint_splits=hint_splits,
+                                 lf_polarity=args.lf_polarity)
 
     # How many leading columns are the hint labeling function. RF/SVM/LR slice these off to build the
     # feature matrix and use the first of them as the supervision target, so the count has to follow
     # --lf_duplication rather than being hardcoded to 3.
-    n_hint_cols = sum(1 for c in df_list[0].columns[1:] if str(c).startswith('hint_train'))
+    n_hint_cols = count_hint_cols(df_list[0].columns[1:])
     if args.label_mode in ['RF', 'SVM', 'LR', 'DP_nohint']:
         assert n_hint_cols > 0, (
             f'--label_mode {args.label_mode} takes its supervision from the hint labeling function, '
@@ -575,8 +620,7 @@ if __name__=='__main__':
             # TOP's test split, those held-out rows supervise this model, which makes a later
             # HINT-vs-CTO comparison partly circular. n_hint_cols follows --lf_duplication rather
             # than assuming the first three columns are the three hint copies.
-            X1, Y = L[L[:,0]!=-1,n_hint_cols:], L[L[:,0]!=-1,0] # subset on where hint is valid
-            X2 = L[:,n_hint_cols:] # predict on all
+            _, X1, Y, X2 = split_hint_supervision(L, df2.columns[1:])   # fit where hint is valid, predict on all
             if args.label_mode == 'RF':
                 model = RandomForestClassifier(n_estimators=1000, max_depth=4, random_state=0)
             elif args.label_mode == 'SVM':
@@ -693,8 +737,21 @@ if __name__=='__main__':
     # TOP's test split was in the label model, and whether the two overrides were applied -- and none
     # of that is currently recoverable from the artifacts. Written next to the labels rather than
     # into them so the CSV schema is unchanged for existing consumers.
+    # The linkage side of the label: one as-of date per run, one censoring window per phase.
+    link_df = pd.read_csv(args.LINKAGE_PATH, low_memory=False)
+    linkage_as_of, linkage_windows = None, None
+    if {'as_of_date', 'censoring_window_days'} <= set(link_df.columns):
+        as_of_vals = link_df['as_of_date'].dropna().unique()
+        assert len(as_of_vals) == 1, f'linkage file mixes as-of dates: {as_of_vals}'
+        linkage_as_of = str(as_of_vals[0])
+        per_phase = link_df.dropna(subset=['censoring_window_days']).groupby('phase')['censoring_window_days'].unique()
+        assert all(len(v) == 1 for v in per_phase), f'more than one censoring window within a phase: {per_phase.to_dict()}'
+        linkage_windows = {str(ph): int(v[0]) for ph, v in per_phase.items()}
     run_config = {
         'label_mode': args.label_mode,
+        'lf_polarity': args.lf_polarity,
+        'linkage_as_of_date': linkage_as_of,
+        'linkage_censoring_window_days_by_phase': linkage_windows,
         'lf_duplication': args.lf_duplication,
         'hint_splits': list(hint_splits),
         'override_mode': args.override_mode,
@@ -704,6 +761,11 @@ if __name__=='__main__':
         'ctti_path': args.CTTI_PATH,
         'linkage_path': args.LINKAGE_PATH,
         'cto_gold_path': args.CTO_GOLD_PATH,
+        'hint_path': args.HINT_PATH,
+        'gpt_path': args.GPT_PATH,
+        'labels_and_tickers_path': args.LABELS_AND_TICKERS_PATH,
+        'studies_with_news_path': args.STUDIES_WITH_NEWS_PATH,
+        'lf_each_thresh_path': args.LF_EACH_THRESH_PATH,
         'written_utc': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
     }
     with open(os.path.join(args.SAVE_PATH, f'run_config_{args.label_mode.lower()}.json'), 'w') as f:

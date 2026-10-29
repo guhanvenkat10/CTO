@@ -10,11 +10,17 @@ with the least evidence available.
     pytest labeling/test_lfs.py
 """
 
+import os
+import sys
+
 import pandas as pd
 import pytest
 
-from lfs import (hint_train_lf, lf_gpt, lf_linkage, lf_pvalues, lf_results_reported,
-                 lf_status)
+# Importable when pytest is run from the repository root, not only from this folder.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from lfs import (count_hint_cols, hint_train_lf, lf_column_names, lf_gpt, lf_linkage, lf_pvalues,
+                 lf_results_reported, lf_status, split_hint_supervision)
 
 ABSTAIN, FAILURE, SUCCESS = -1, 0, 1
 
@@ -38,12 +44,27 @@ def test_linkage_recent_trial_abstains(tmp_path):
                  ("NCT03", "Not sure"), ("NCT04", "Recent trial")],
                 ["nctid", "outcome"])
 
-    df = lf_linkage(path).set_index("nct_id")["lf"]
+    df = lf_linkage(path, polarity="abstain").set_index("nct_id")["lf"]
 
     assert df["NCT01"] == SUCCESS
     assert df["NCT02"] == FAILURE
     assert df["NCT03"] == ABSTAIN
     assert df["NCT04"] == ABSTAIN
+
+
+def test_linkage_default_reproduces_the_release(tmp_path):
+    """The default is the released polarity: anything not listed, 'Recent trial' included, votes 0."""
+    path = _csv(tmp_path, "linkage.csv",
+                [("NCT01", "Success"), ("NCT02", "Failure"),
+                 ("NCT03", "Not sure"), ("NCT04", "Recent trial")],
+                ["nctid", "outcome"])
+
+    df = lf_linkage(path).set_index("nct_id")["lf"]
+
+    assert df["NCT01"] == SUCCESS
+    assert df["NCT02"] == FAILURE
+    assert df["NCT03"] == ABSTAIN
+    assert df["NCT04"] == FAILURE
 
 
 def test_linkage_rejects_an_unmapped_outcome(tmp_path):
@@ -53,7 +74,7 @@ def test_linkage_rejects_an_unmapped_outcome(tmp_path):
                 ["nctid", "outcome"])
 
     with pytest.raises(AssertionError, match="unmapped linkage outcome"):
-        lf_linkage(path)
+        lf_linkage(path, polarity="abstain")
 
 
 # --------------------------------------------------------------------------- lf_results_reported
@@ -71,7 +92,7 @@ def test_results_reported_abstains_when_nothing_is_posted(tmp_path):
         columns=["nct_id", "were_results_reported"],
     ).to_csv(p, sep="|", index=False)
 
-    df = lf_results_reported(str(tmp_path) + "/").set_index("nct_id")["lf"]
+    df = lf_results_reported(str(tmp_path) + "/", polarity="abstain").set_index("nct_id")["lf"]
 
     assert df["NCT01"] == SUCCESS
     assert df["NCT02"] == ABSTAIN
@@ -79,14 +100,14 @@ def test_results_reported_abstains_when_nothing_is_posted(tmp_path):
     assert ABSTAIN in set(df), "this channel must be able to abstain"
 
 
-def test_results_reported_legacy_flag_restores_the_failure_vote(tmp_path):
-    """The previous behaviour stays reachable, so old releases can be reproduced exactly."""
+def test_results_reported_default_reproduces_the_release(tmp_path):
+    """The default is the released polarity, so a fresh clone reproduces old releases exactly."""
     p = tmp_path / "calculated_values.txt"
     pd.DataFrame(
         [("NCT01", "t"), ("NCT02", "f")], columns=["nct_id", "were_results_reported"],
     ).to_csv(p, sep="|", index=False)
 
-    df = lf_results_reported(str(tmp_path) + "/", abstain_when_unposted=False)
+    df = lf_results_reported(str(tmp_path) + "/")
     df = df.set_index("nct_id")["lf"]
 
     assert df["NCT01"] == SUCCESS
@@ -106,11 +127,29 @@ def test_gpt_not_sure_abstains(tmp_path):
                 [("NCT01", "Success"), ("NCT02", "Not sure"), ("NCT03", "Failure")],
                 ["nctid", "outcome"])
 
-    df = lf_gpt(path).set_index("nct_id")["lf"]
+    df = lf_gpt(path, polarity="abstain").set_index("nct_id")["lf"]
 
     assert df["NCT01"] == SUCCESS
     assert df["NCT02"] == ABSTAIN
     assert df["NCT03"] == FAILURE
+
+
+def test_gpt_default_reproduces_the_release(tmp_path):
+    path = _csv(tmp_path, "gpt.csv",
+                [("NCT01", "Success"), ("NCT02", "Not sure"), ("NCT03", "Failure")],
+                ["nctid", "outcome"])
+
+    df = lf_gpt(path).set_index("nct_id")["lf"]
+
+    assert df["NCT01"] == SUCCESS
+    assert df["NCT02"] == FAILURE
+    assert df["NCT03"] == FAILURE
+
+
+@pytest.mark.parametrize("fn", [lf_results_reported, lf_linkage, lf_gpt])
+def test_unknown_polarity_is_rejected(fn, tmp_path):
+    with pytest.raises(AssertionError, match="polarity must be one of"):
+        fn(str(tmp_path) + "/x.csv", polarity="abstian")
 
 
 # --------------------------------------------------------------------------- hint_train_lf
@@ -198,45 +237,39 @@ def _fake_lf(name):
 
 
 def test_legacy_column_layout_is_unchanged_and_dedupe_collapses_it():
-    """The PR's load-bearing claim is that every new flag defaults to current behaviour.
+    """The default layout is the released 13-column one, in the released order. Asserted on what
+    lf_column_names (the helper get_lfs uses) returns, so this guards the code, not a copy of it."""
+    legacy = lf_column_names(dedupe_lfs=False)
+    dedupe = lf_column_names(dedupe_lfs=True)
 
-    For --lf_duplication that means the released 13-column layout, in the released order, with the
-    four repeated labeling functions still repeated. Asserted here rather than reasoned about,
-    because 'the default is unchanged' is exactly the sort of claim that rots silently.
-    """
-    legacy = ['hint_train', 'hint_train2', 'hint_train3', 'status', 'status2', 'gpt', 'gpt2',
-              'linkage', 'linkage2', 'stock_price', 'results_reported', 'new_headlines', 'pvalues']
-    dedupe = ['hint_train', 'status', 'gpt', 'linkage', 'stock_price', 'results_reported',
-              'new_headlines', 'pvalues']
-
-    assert len(legacy) == 13
-    assert len(dedupe) == 8
-    assert legacy[:3] == ['hint_train'] * 1 + ['hint_train2', 'hint_train3']
-    # the count of leading hint columns is what RF/SVM/LR slice on
-    assert sum(1 for c in legacy if c.startswith('hint_train')) == 3
-    assert sum(1 for c in dedupe if c.startswith('hint_train')) == 1
+    assert legacy == ['hint_train', 'hint_train2', 'hint_train3', 'status', 'status2', 'gpt', 'gpt2',
+                      'linkage', 'linkage2', 'stock_price', 'results_reported', 'new_headlines', 'pvalues']
+    assert dedupe == ['hint_train', 'status', 'gpt', 'linkage', 'stock_price', 'results_reported',
+                      'new_headlines', 'pvalues']
+    assert count_hint_cols(legacy) == 3 and count_hint_cols(dedupe) == 1
     # every distinct labeling function survives deduplication
-    assert {c.rstrip('23') for c in legacy} == {c.rstrip('23') for c in dedupe}
+    assert {c.rstrip('23') for c in legacy} == set(dedupe)
 
 
-def test_hint_column_count_drives_the_feature_slice():
-    """L[:, 3:] was hardcoded. Skipping a hint column shifted the features against the labels.
-
-    With the count derived from the actual layout, the feature matrix starts at the first non-hint
-    column whatever --lf_duplication and --SKIP_LIST did, and Y stays the hint labeling function.
-    """
+@pytest.mark.parametrize("columns, n_hint", [
+    (lf_column_names(dedupe_lfs=False), 3),
+    (lf_column_names(dedupe_lfs=True), 1),
+    ([c for c in lf_column_names(dedupe_lfs=False) if c != 'hint_train'], 2),   # --SKIP_LIST "['hint_train']"
+])
+def test_hint_column_count_drives_the_feature_slice(columns, n_hint):
+    """split_hint_supervision is what the main block uses for RF/SVM/LR. The features must start at the
+    first non-hint column, Y must be the first hint column, and rows where hint abstains are dropped."""
     import numpy as np
 
-    for names, expected in [
-        (['hint_train', 'hint_train2', 'hint_train3', 'status', 'gpt'], 3),
-        (['hint_train', 'status', 'gpt'], 1),
-        (['hint_train2', 'hint_train3', 'status', 'gpt'], 2),   # --SKIP_LIST "['hint_train']"
-    ]:
-        n_hint = sum(1 for c in names if str(c).startswith('hint_train'))
-        assert n_hint == expected
+    columns = list(columns) + ['pred']                       # main appends a pred column before slicing
+    rng = np.random.default_rng(0)
+    L = rng.integers(-1, 2, size=(50, len(columns)))
+    L[:5, 0] = -1
+    got_n, X1, Y, X2 = split_hint_supervision(L, columns)
 
-        L = np.arange(len(names) * 2).reshape(2, len(names))
-        features = L[:, n_hint:]
-        assert features.shape[1] == len(names) - n_hint
-        # the first feature column is the first non-hint labeling function, never a hint copy
-        assert names[n_hint] == 'status'
+    assert got_n == n_hint
+    valid = L[:, 0] != -1
+    assert (Y == L[valid, 0]).all()
+    assert X1.shape == (valid.sum(), len(columns) - n_hint)
+    assert X2.shape == (len(L), len(columns) - n_hint)
+    assert not columns[n_hint].startswith('hint_train')       # first feature is never a hint copy
