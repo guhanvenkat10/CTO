@@ -98,6 +98,18 @@ third scoring of TOP test.
 | gradient boosting on registration fields | 0.673 | 0.585 |
 | **branch minus HINT (rebuilt)** | **+0.077 [0.036, 0.116]** | **-0.051 [-0.113, 0.012]** |
 
+**How the branch is attached.** HINT is retrained from scratch for every arm, on TOP's standard train split
+(`data/phase_*_train.csv`), with the upstream per-phase settings (`learn_phase*.py` at 8dc0497: 5 epochs, batch 32,
+lr 1e-3 / 3e-4 / 1e-3 for Phases I / II / III, ADMET-pretrained MPNN loaded fresh per phase, last-epoch model kept).
+Nothing is added to an already trained model. HINT's own inputs (SMILES, ICD codes, criteria text) and its code are
+unchanged. The extra input is one row of 84 numbers per trial, read from a CSV keyed by NCT ID: the registration fields
+above, each standardized with the mean and standard deviation of TOP train+valid (features only, no labels), gaps set to
+0, plus a missing flag for the 7 fields that have gaps. A subclass of `HINTModel` passes that row through
+`Linear(84, 32) -> ReLU -> Dropout(0.2) -> Linear(32, 1)` and adds the result to HINT's output logit before the sigmoid
+and the BCE loss. The last layer is initialized to zero, so at step 0 the model is exactly HINT. The branch trains
+jointly with the rest of HINT, same optimizer and learning rate. The sponsor-only arm is the same branch on the 5
+sponsor-class columns. Predictions are made in eval mode.
+
 It passes on TOP and fails on the annotation, where the point estimate is negative. By the rule we froze, that makes it a
 TOP-specific result. Every seed agrees on both sets.
 
